@@ -47,6 +47,16 @@ import {
   generateOutdoorRoadGuidance,
   launchGoogleMapsCoPilot,
 } from '../utils/outdoor_road_navigator';
+import {
+  GroundSlamState,
+  createInitialGroundSlamState,
+  projectSlantToGroundPlane,
+  updateGroundSlamGrid,
+  recordGroundSlamStep,
+  getRelativeWalkableCells,
+  computeReturnToStartGuidance,
+  CELL_SIZE_M,
+} from '../utils/ground_slam';
 import { getUIConfig, getAudioConfig } from '../config/app_config';
 
 function getLocationAndVoiceModule(): any {
@@ -69,6 +79,9 @@ export default function SonarDashboard() {
   const [mapObjects, setMapObjects] = useState<MapObject[]>([]);
   const [roomSectors, setRoomSectors] = useState<PolarSector[]>(() =>
     createInitialRoomSectors()
+  );
+  const [groundSlam, setGroundSlam] = useState<GroundSlamState>(() =>
+    createInitialGroundSlamState()
   );
   const [isScanning, setIsScanning] = useState<boolean>(false);
   const [isCalibratingState, setIsCalibratingState] = useState<boolean>(false);
@@ -97,10 +110,13 @@ export default function SonarDashboard() {
   const lastSpokenTextRef = useRef<string>('');
   const lastUiTapTimeRef = useRef<number>(0);
 
-  // Pedestrian Dead Reckoning step callback shifts the 2D room map as the blind user walks
+  // Pedestrian Dead Reckoning step callback shifts the 2D room map & updates Ground-SLAM pose + breadcrumbs
   const handleUserStepDetected = useCallback(
     (stepLengthMeters: number, headingYawRad: number) => {
       const headingDeg = normalizeAngleDeg((headingYawRad * 180) / Math.PI);
+      setGroundSlam(prev =>
+        recordGroundSlamStep(prev, stepLengthMeters, headingDeg)
+      );
       setRoomSectors(prevSectors => {
         const { updatedSectors } = applyUserStepToRoomMap(
           prevSectors,
@@ -388,7 +404,7 @@ export default function SonarDashboard() {
     speakText,
   ]);
 
-  // Speak full 2D Floorplan or Road Summary on demand
+  // Speak full 2D Floorplan + Ground-SLAM Walkable Area or Road Summary on demand
   const handleDescribeMap = useCallback(() => {
     ReactNativeHapticFeedback.trigger('impactLight', {
       enableVibrateFallback: true,
@@ -401,16 +417,32 @@ export default function SonarDashboard() {
         mapObjects,
         headingDeg
       );
-      speakText(floorplan.fullRoomSpokenDescription, true, true);
+      speakText(
+        `Ground SLAM verified ${groundSlam.walkableAreaSqM} square metres of walkable floor. ${floorplan.fullRoomSpokenDescription}`,
+        true,
+        true
+      );
     } else {
       const roadSpeech = generateOutdoorRoadGuidance(
         mapObjects,
         headingDeg,
         roadContext
       );
-      speakText(roadSpeech, true, true);
+      speakText(
+        `Ground SLAM verified ${groundSlam.walkableAreaSqM} square metres of safe sidewalk. ${roadSpeech}`,
+        true,
+        true
+      );
     }
-  }, [navMode, roomSectors, mapObjects, sensorData.yaw, roadContext, speakText]);
+  }, [
+    navMode,
+    roomSectors,
+    mapObjects,
+    sensorData.yaw,
+    roadContext,
+    groundSlam.walkableAreaSqM,
+    speakText,
+  ]);
 
   // Launch Google Maps Walking Co-Pilot
   const handleLaunchGoogleMaps = useCallback(
@@ -432,12 +464,14 @@ export default function SonarDashboard() {
         true,
         true
       );
-      await launchGoogleMapsCoPilot(customDestination || roadContext.activeDestinationName || undefined);
+      await launchGoogleMapsCoPilot(
+        customDestination || roadContext.activeDestinationName || undefined
+      );
     },
     [roadContext.activeDestinationName, speakText]
   );
 
-  // Handle Native Voice Commands ("Room Mode", "Road Mode", "Start Scan", "Where is the door", etc.)
+  // Handle Native Voice Commands ("Room Mode", "Road Mode", "Start Scan", "Where is the door", "Return to start", etc.)
   const handleVoiceCommandPress = useCallback(async () => {
     if (isListeningVoice) return;
     ReactNativeHapticFeedback.trigger('impactMedium', {
@@ -486,6 +520,14 @@ export default function SonarDashboard() {
         case 'DESCRIBE_MAP':
           handleDescribeMap();
           break;
+        case 'RETURN_TO_START': {
+          const returnSpeech = computeReturnToStartGuidance(
+            groundSlam,
+            headingDeg
+          );
+          speakText(returnSpeech, true, false);
+          break;
+        }
         case 'FIND_DOORWAY': {
           const floorplan = buildRoomFloorplanSummary(
             roomSectors,
@@ -514,7 +556,8 @@ export default function SonarDashboard() {
         case 'CLEAR_MAP':
           setMapObjects([]);
           setRoomSectors(createInitialRoomSectors());
-          speakText('2D map cleared.', true, false);
+          setGroundSlam(createInitialGroundSlamState());
+          speakText('2D Ground SLAM map cleared.', true, false);
           break;
         case 'OPEN_GOOGLE_MAPS':
           await handleLaunchGoogleMaps(action.destination);
@@ -552,7 +595,7 @@ export default function SonarDashboard() {
         }
         default:
           speakText(
-            `Heard "${action.rawText}". Say Room Mode, Road Mode, Start Scan, Stop Scan, Describe Map, or Google Maps.`,
+            `Heard "${action.rawText}". Say Room Mode, Road Mode, Start Scan, Stop Scan, Describe Map, Return to Start, or Google Maps.`,
             true,
             false
           );
@@ -573,6 +616,7 @@ export default function SonarDashboard() {
     sensorData.yaw,
     roomSectors,
     mapObjects,
+    groundSlam,
     pauseForVoiceCommand,
     resumeAfterVoiceCommand,
     handleSelectRoomMode,
@@ -583,30 +627,27 @@ export default function SonarDashboard() {
     speakText,
   ]);
 
-  // Process incoming hybrid ONNX + Physical ToF Sonar Predictions
+  // Process incoming hybrid ONNX + Physical ToF Sonar Predictions with Ground-SLAM Projection
   useEffect(() => {
     if (!prediction) return;
 
     const theta = sensorData.yaw; // IMU Yaw angle in radians
+    const pitch = sensorData.pitch; // IMU Pitch angle in radians
     const totalAngle = theta + prediction.angle;
-    const range = Math.max(0.25, Math.min(4.0, prediction.range));
-
-    // Cartesian Coordinates for 2D SLAM Top-Down Map (relative to user)
-    const xRel = Number((range * Math.sin(totalAngle)).toFixed(2));
-    const yRel = Number((range * Math.cos(totalAngle)).toFixed(2));
+    const rawSlantRange = Math.max(0.25, Math.min(4.0, prediction.range));
     const bearingDeg = Math.round(
       normalizeAngleDeg((totalAngle * 180) / Math.PI)
     );
     const userHeadingDeg = normalizeAngleDeg((theta * 180) / Math.PI);
 
-    // Determine indoor vs outdoor semantic classification
+    // Determine initial indoor vs outdoor semantic classification
     let label: string = prediction.semanticLabel || 'OBSTACLE';
     let objType: 'obstacle' | 'wall' | 'doorway' | 'clear' = prediction.type;
 
     if (navMode === 'ROAD') {
       const roadMapped = mapIndoorLabelToOutdoorRoadHazard(
         label,
-        range,
+        rawSlantRange,
         prediction.pulseWidthMeters || prediction.width
       );
       label = roadMapped.label;
@@ -619,6 +660,30 @@ export default function SonarDashboard() {
       else if (prediction.width > 0.65) label = 'DESK';
       else label = 'CHAIR';
     }
+
+    // 1. Ground-SLAM Tilt Projection, Floor Bounce Cancellation & Curb/Drop-Off Detection
+    const groundProj = projectSlantToGroundPlane(
+      rawSlantRange,
+      pitch,
+      objType,
+      label
+    );
+
+    const range = Math.max(0.25, Math.min(4.0, groundProj.horizontalRangeM));
+    if (groundProj.overrideLabel) label = groundProj.overrideLabel;
+    if (groundProj.overrideType) objType = groundProj.overrideType;
+
+    // 2. Update 2D Log-Odds Occupancy Grid via Bresenham Raycasting
+    const updatedGroundSlam = updateGroundSlamGrid(
+      groundSlam,
+      bearingDeg,
+      groundProj
+    );
+    setGroundSlam(updatedGroundSlam);
+
+    // Cartesian Coordinates for 2D SLAM Top-Down Map (relative to user on horizontal ground plane)
+    const xRel = Number((range * Math.sin(totalAngle)).toFixed(2));
+    const yRel = Number((range * Math.cos(totalAngle)).toFixed(2));
 
     // Update 360° 2D Room Boundary Sectors
     const updatedSectors = updateRoomSectorsWithScan(
@@ -656,12 +721,23 @@ export default function SonarDashboard() {
 
     setMapObjects(updatedMap);
 
-    // Immediate haptic warning for close obstacles
-    const isImmediateHazard = objType !== 'clear' && range < uiConfig.proximityThreshold;
+    // Immediate haptic warning for close obstacles, curbs, or ground drop-offs
+    const isGroundHazard =
+      groundProj.anomaly === 'CURB_STEP_UP' ||
+      groundProj.anomaly === 'GROUND_DROP_OFF';
+    const isImmediateHazard =
+      isGroundHazard ||
+      (objType !== 'clear' && range < uiConfig.proximityThreshold);
+
     if (isImmediateHazard) {
       ReactNativeHapticFeedback.trigger('notificationError', {
         enableVibrateFallback: true,
       });
+    }
+
+    if (isGroundHazard && groundProj.hazardSpeech) {
+      speakText(groundProj.hazardSpeech, true, false);
+      return;
     }
 
     if (navMode === 'ROOM') {
@@ -697,6 +773,19 @@ export default function SonarDashboard() {
     mapObjects,
     userHeadingDeg
   );
+  const walkableCells = getRelativeWalkableCells(groundSlam, 80);
+
+  // Convert Ground-SLAM walked breadcrumb trajectory into SVG polyline points
+  const breadcrumbSvgPoints = groundSlam.breadcrumbs
+    .map(b => {
+      const relX = b.x - groundSlam.userWorldX;
+      const relY = b.y - groundSlam.userWorldY;
+      return `${(MAP_CENTER.x + relX * SCALE_FACTOR).toFixed(1)},${(
+        MAP_CENTER.y -
+        relY * SCALE_FACTOR
+      ).toFixed(1)}`;
+    })
+    .join(' ');
 
   // Convert 2D room boundary polygon vertices into SVG coordinate string
   const roomPolygonSvgPoints = floorplanSummary.polygonPoints
@@ -771,19 +860,19 @@ export default function SonarDashboard() {
         </TouchableOpacity>
       </View>
 
-      {/* LIVE TELEMETRY & ROOM / STREET METADATA SUB-BAR */}
+      {/* LIVE TELEMETRY & GROUND-SLAM METADATA SUB-BAR */}
       <View style={styles.telemetryBar} importantForAccessibility="no-hide-descendants">
         <Text style={styles.telemetryTitle} numberOfLines={1}>
           {navMode === 'ROOM'
-            ? `📐 2D Floorplan: ${floorplanSummary.roomWidthM}m × ${floorplanSummary.roomDepthM}m (${floorplanSummary.scannedCoveragePercent}% Mapped)`
-            : `📍 ${roadContext.streetName}`}
+            ? `📐 Ground-SLAM: ${floorplanSummary.roomWidthM}m×${floorplanSummary.roomDepthM}m (${groundSlam.walkableAreaSqM}m² Free)`
+            : `📍 ${roadContext.streetName} (${groundSlam.walkableAreaSqM}m² Clear)`}
         </Text>
         <Text style={styles.telemetryPill}>
           {`👣 ${sensorData.stepCount || 0} steps • ${Math.round(userHeadingDeg)}°`}
         </Text>
       </View>
 
-      {/* 2D FLOORPLAN SLAM & SAFE WALKING PATH VISUALIZER (Hidden from TalkBack focus trap) */}
+      {/* 2D GROUND-SLAM OCCUPANCY GRID & SAFE WALKING PATH VISUALIZER */}
       <View
         style={styles.mapArea}
         accessible={false}
@@ -817,9 +906,9 @@ export default function SonarDashboard() {
 
           {/* Mode-Specific 2D Geometry Layer */}
           {navMode === 'ROOM' ? (
-            < Polygon
+            <Polygon
               points={roomPolygonSvgPoints}
-              fill="rgba(2, 132, 199, 0.10)"
+              fill="rgba(2, 132, 199, 0.08)"
               stroke="#0284C7"
               strokeWidth={2.5}
             />
@@ -850,6 +939,24 @@ export default function SonarDashboard() {
             </G>
           )}
 
+          {/* Ground-SLAM Verified Walkable Ground Occupancy Cells */}
+          {walkableCells.map(cell => {
+            const cellPx = Math.max(8, CELL_SIZE_M * SCALE_FACTOR);
+            const cx = MAP_CENTER.x + cell.relX * SCALE_FACTOR - cellPx / 2;
+            const cy = MAP_CENTER.y - cell.relY * SCALE_FACTOR - cellPx / 2;
+            return (
+              <Rect
+                key={cell.id}
+                x={cx}
+                y={cy}
+                width={cellPx}
+                height={cellPx}
+                fill="rgba(16, 185, 129, 0.18)"
+                rx={2}
+              />
+            );
+          })}
+
           {/* Crosshair Axes */}
           <Line
             x1={MAP_CENTER.x}
@@ -867,6 +974,17 @@ export default function SonarDashboard() {
             stroke="#CBD5E1"
             strokeWidth={1.2}
           />
+
+          {/* Ground-SLAM Walked Breadcrumb Trail */}
+          {groundSlam.breadcrumbs.length >= 2 && (
+            <Polyline
+              points={breadcrumbSvgPoints}
+              fill="none"
+              stroke="#0284C7"
+              strokeWidth={2.5}
+              strokeDasharray="3 3"
+            />
+          )}
 
           {/* Green Safe Walking Path Polyline + Target Beacon */}
           {floorplanSummary.safePath.waypoints.length >= 2 && (

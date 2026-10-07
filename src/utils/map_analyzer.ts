@@ -24,6 +24,7 @@ export type VoiceCommandAction =
   | { type: 'STOP_SCAN' }
   | { type: 'DESCRIBE_MAP' }
   | { type: 'FIND_DOORWAY' }
+  | { type: 'RETURN_TO_START' }
   | { type: 'CLEAR_MAP' }
   | { type: 'OPEN_GOOGLE_MAPS'; destination?: string }
   | { type: 'NAVIGATE_DESTINATION'; destination: string }
@@ -32,7 +33,7 @@ export type VoiceCommandAction =
 /**
  * Parses natural spoken phrases from a blind user into deterministic app actions.
  * Supports commands like "Click Room Mode", "Road Mode", "Start Scan", "Stop Scan",
- * "Describe Map", "Where is the door", "Open Google Maps to pharmacy", etc.
+ * "Describe Map", "Where is the door", "Return to start", "Open Google Maps to pharmacy", etc.
  */
 export function parseVoiceCommandIntent(spokenText: string): VoiceCommandAction {
   const raw = (spokenText || '').trim();
@@ -53,6 +54,15 @@ export function parseVoiceCommandIntent(spokenText: string): VoiceCommandAction 
     text.includes('sidewalk')
   ) {
     return { type: 'SWITCH_ROAD_MODE' };
+  }
+
+  if (
+    text.includes('return to start') ||
+    text.includes('go back') ||
+    text.includes('back to start') ||
+    text.includes('retrace')
+  ) {
+    return { type: 'RETURN_TO_START' };
   }
 
   if (text.includes('google map') || text.includes('co-pilot') || text.includes('copilot')) {

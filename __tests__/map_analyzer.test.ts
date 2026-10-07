@@ -17,6 +17,13 @@ import {
   checkSidewalkDrift,
   mapIndoorLabelToOutdoorRoadHazard,
 } from '../src/utils/outdoor_road_navigator';
+import {
+  createInitialGroundSlamState,
+  projectSlantToGroundPlane,
+  updateGroundSlamGrid,
+  recordGroundSlamStep,
+  computeReturnToStartGuidance,
+} from '../src/utils/ground_slam';
 
 describe('Map Analyzer', () => {
   describe('generateMapSpeechNarrative', () => {
@@ -150,8 +157,9 @@ describe('Map Analyzer', () => {
       expect(nav.type).toBe('NAVIGATE_DESTINATION');
     });
 
-    it('should parse doorway and map description commands', () => {
+    it('should parse doorway, return to start, and map description commands', () => {
       expect(parseVoiceCommandIntent('Where is the door').type).toBe('FIND_DOORWAY');
+      expect(parseVoiceCommandIntent('Return to start').type).toBe('RETURN_TO_START');
       expect(parseVoiceCommandIntent('Describe Map').type).toBe('DESCRIBE_MAP');
     });
   });
@@ -202,6 +210,38 @@ describe('Map Analyzer', () => {
     it('should map indoor reflections into outdoor roadside hazards', () => {
       expect(mapIndoorLabelToOutdoorRoadHazard('WALL', 1.8, 0.8).label).toBe('PARKED VEHICLE');
       expect(mapIndoorLabelToOutdoorRoadHazard('CHAIR', 1.5, 0.25).label).toBe('SIGNPOST / POLE');
+    });
+  });
+
+  describe('Acoustic Ground-SLAM Engine', () => {
+    it('should cancel false floor bounce when phone is tilted down at flat floor', () => {
+      // Phone held at 1.2m, tilted down by -30 degrees (-0.5236 rad) -> expected floor hit at 1.2 / sin(30°) = 2.4m
+      const proj = projectSlantToGroundPlane(2.38, -0.5236, 'wall', 'WALL', 1.2);
+      expect(proj.isFloorBounceCancelled).toBe(true);
+      expect(proj.anomaly).toBe('FLAT_GROUND_BOUNCE');
+      expect(proj.overrideType).toBe('clear');
+    });
+
+    it('should detect ground drop-off / downward stairs when expected floor reflection is missing', () => {
+      // Phone tilted down by -35 degrees (-0.61 rad) -> expected floor at ~2.09m, but measured range is 3.1m
+      const proj = projectSlantToGroundPlane(3.1, -0.61, 'obstacle', 'OBSTACLE', 1.2);
+      expect(proj.anomaly).toBe('GROUND_DROP_OFF');
+      expect(proj.overrideLabel).toBe('DROP-OFF / STAIRS');
+      expect(proj.hazardSpeech).toContain('drop-off');
+    });
+
+    it('should update 2D log-odds occupancy grid and compute return-to-start guidance', () => {
+      let slam = createInitialGroundSlamState();
+      const proj = projectSlantToGroundPlane(2.5, 0, 'wall', 'WALL', 1.2);
+      slam = updateGroundSlamGrid(slam, 0, proj);
+      expect(slam.walkableAreaSqM).toBeGreaterThan(0.25);
+
+      slam = recordGroundSlamStep(slam, 0.65, 0);
+      slam = recordGroundSlamStep(slam, 0.65, 0);
+      expect(slam.breadcrumbs.length).toBe(3);
+
+      const guidance = computeReturnToStartGuidance(slam, 0);
+      expect(guidance).toContain('Return to start');
     });
   });
 });
