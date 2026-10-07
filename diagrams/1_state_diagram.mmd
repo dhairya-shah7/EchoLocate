@@ -1,0 +1,51 @@
+﻿%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#EFF6FF', 'primaryTextColor': '#0F172A', 'primaryBorderColor': '#0284C7', 'lineColor': '#0284C7', 'secondaryColor': '#FEFCE8', 'tertiaryColor': '#F8FAFC', 'fontSize': '18px'}}}%%
+stateDiagram-v2
+    direction LR
+    [*] --> Initializing
+
+    state "1. Initializing" as Initializing {
+        direction TB
+        CopyAssets : Copy ONNX to Cache
+        InitEngines : Init ONNX, Audio & TTS
+        CopyAssets --> InitEngines
+    }
+
+    Initializing --> Idle : UI Ready
+
+    state "2. Idle State" as Idle {
+        WaitTap : Full-Screen Button Ready
+    }
+
+    Idle --> Calibrating : Single Tap
+
+    state "3. Calibrating (1.5s)" as Calibrating {
+        direction TB
+        SampleIMU : Read 40 IMU Samples (50Hz)
+        LockBias : Lock Gyro/Accel/Mag Bias
+        SampleIMU --> LockBias
+    }
+
+    Calibrating --> Scanning : Bias Locked
+    Calibrating --> Idle : Cancel
+
+    state "4. Active Sonar Scanning (700ms Loop)" as Scanning {
+        direction TB
+        Ping : Emit 18-22kHz Chirp & Record 48kHz PCM
+        DSP : 1D FFT Envelope + 2D Goertzel [64x64]
+        Infer : ONNX Transformer / ToF Fallback
+        SLAM : Fuse IMU Yaw -> 2D Cartesian Map (X,Y)
+        Ping --> DSP
+        DSP --> Infer
+        Infer --> SLAM
+    }
+
+    Scanning --> Feedback : Object Mapped
+
+    state "5. Multi-Modal Feedback" as Feedback {
+        direction TB
+        Hazard : Range < 0.6m -> Heavy Haptic + Urgent TTS
+        Safe : Range >= 0.6m -> Queued Narrative + 2D SVG
+    }
+
+    Feedback --> Scanning : Next Ping
+    Scanning --> Idle : Tap to Stop

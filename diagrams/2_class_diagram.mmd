@@ -1,0 +1,65 @@
+﻿%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#EFF6FF', 'primaryTextColor': '#0F172A', 'primaryBorderColor': '#0284C7', 'lineColor': '#0284C7', 'fontSize': '16px'}}}%%
+classDiagram
+    direction LR
+
+    class SonarDashboard {
+        -List~MapObject~ mapObjects
+        -boolean isScanning
+        -string lastSpeech
+        +handleSingleButtonPress()
+        +handleNewPrediction(pred)
+        +speakText(text, isPriority)
+    }
+
+    class UseSonarAudio {
+        +boolean isRecording
+        +triggerPing()
+        -setupAudio()
+    }
+
+    class UseSensorFusion {
+        +SensorData sensorData
+        +boolean isCalibrating
+        +startCalibration()
+        +computeDeltaSeconds()
+    }
+
+    class UseSonarInference {
+        +SonarPrediction prediction
+        +runInference(spec2D, env1D)
+        -runDspAcousticInference()
+    }
+
+    class DspOptimized {
+        +generateReferenceChirp()
+        +computeEnvelope(pcm)
+        +computeSpectrogram(pcm)
+        +extractAcousticDistance()
+    }
+
+    class MapAnalyzer {
+        +generateMapSpeechNarrative()
+        -getDirectionString()
+    }
+
+    class AppStoreAndConfig {
+        +getConfig() AppConfig
+        +loadPreset(preset)
+        +setScanning(bool)
+        +addMapObject(obj)
+    }
+
+    class AssetCopyAndError {
+        +copyAssetToCache(onnx)
+        +handleError(err, category)
+        +RecoveryStrategies()
+    }
+
+    SonarDashboard --> UseSonarAudio : 1. Pings 18-22kHz
+    SonarDashboard --> UseSensorFusion : 2. Reads IMU Yaw
+    SonarDashboard --> UseSonarInference : 3. Runs AI / ToF
+    SonarDashboard --> MapAnalyzer : 4. Voice & Radar
+    UseSonarAudio --> DspOptimized : 48kHz PCM Stream
+    UseSonarInference --> DspOptimized : FFT & Goertzel
+    UseSensorFusion --> AppStoreAndConfig : State & Presets
+    UseSonarInference --> AssetCopyAndError : ONNX & Recovery

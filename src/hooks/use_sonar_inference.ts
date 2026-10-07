@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { NativeModules, Platform } from 'react-native';
 import * as ort from 'onnxruntime-react-native';
-import { handleError, ErrorCategory, RecoveryStrategies } from '../utils/error_handler';
+import { handleError, ErrorCategory } from '../utils/error_handler';
 import { extractAcousticDistance } from '../utils/dsp_optimized';
 
 export interface SonarPrediction {
@@ -10,6 +10,9 @@ export interface SonarPrediction {
   width: number;      // Object width (metres)
   height: number;     // Object height (metres)
   type: 'obstacle' | 'wall' | 'doorway' | 'clear'; // Classification
+  semanticLabel?: 'WALL' | 'DOORWAY' | 'DESK' | 'BED' | 'CHAIR' | 'OBSTACLE' | 'CLEAR';
+  pulseWidthMeters?: number;
+  secondaryEchoRange?: number | null;
   confidence: number; // Detection confidence (0.0 to 1.0)
 }
 
@@ -31,7 +34,6 @@ export function useSonarInference(modelPath: string) {
   const [error, setError] = useState<string | null>(null);
   const sessionRef = useRef<ort.InferenceSession | null>(null);
 
-  // Initialize the ONNX Runtime Session
   useEffect(() => {
     async function loadModel() {
       try {
@@ -41,7 +43,6 @@ export function useSonarInference(modelPath: string) {
         }
 
         const session = await ort.InferenceSession.create(resolvedPath);
-        
         sessionRef.current = session;
         setIsModelLoading(false);
         setError(null);
@@ -50,7 +51,6 @@ export function useSonarInference(modelPath: string) {
         handleError(err, ErrorCategory.MODEL);
         console.warn('ONNX model session init notice, running native acoustic DSP engine:', msg);
         setIsModelLoading(false);
-        // Do not block app: DSP acoustic engine provides real-time ToF measurements
       }
     }
     loadModel();
@@ -58,36 +58,31 @@ export function useSonarInference(modelPath: string) {
 
   const runDspAcousticInference = (envelope1D: Float32Array) => {
     const acoustic = extractAcousticDistance(envelope1D);
-    let type: 'obstacle' | 'wall' | 'doorway' | 'clear' = 'obstacle';
-    if (acoustic.isClear || acoustic.range >= 3.8) {
-      type = 'clear';
-    } else if (acoustic.peakAmplitude > 0.65) {
-      type = 'wall';
-    } else {
-      type = 'obstacle';
-    }
 
     setPrediction({
       range: acoustic.range,
       angle: 0.0,
-      width: type === 'wall' ? 1.5 : 0.6,
-      height: 1.2,
-      type,
+      width: acoustic.estimatedWidth,
+      height: acoustic.estimatedHeight,
+      type: acoustic.classifiedType,
+      semanticLabel: acoustic.semanticLabel,
+      pulseWidthMeters: acoustic.pulseWidthMeters,
+      secondaryEchoRange: acoustic.secondaryEchoRange,
       confidence: acoustic.confidence,
     });
     setError(null);
   };
 
-  // Execute inference on the dual-branch DSP outputs
   const runInference = async (spectrogram2D: Float32Array, envelope1D: Float32Array) => {
+    // Always compute physical Time-of-Flight and multi-echo features from the calibrated DSP envelope
+    const acoustic = extractAcousticDistance(envelope1D);
+
     if (!sessionRef.current) {
-      // Seamlessly execute acoustic DSP Time-of-Flight engine
       runDspAcousticInference(envelope1D);
       return;
     }
-    
+
     try {
-      // Ensure Float32Array input size matches expected tensor dimensions exactly
       let spec = spectrogram2D;
       if (!spec || spec.length !== 4096) {
         const padded = new Float32Array(4096);
@@ -102,54 +97,36 @@ export function useSonarInference(modelPath: string) {
         env = padded;
       }
 
-      // 1. Sanitize Float32Array elements to strictly finite numbers bounded between 0.0 and 1.0
-      // Use a small epsilon to avoid exactly 0 or 1 which can cause numerical issues
       const epsilon = 1e-6;
       for (let i = 0; i < 4096; i++) {
         const v = spec[i];
-        if (typeof v !== 'number' || isNaN(v) || !isFinite(v)) {
-          spec[i] = epsilon;
-        } else {
-          spec[i] = Math.max(epsilon, Math.min(1.0 - epsilon, v));
-        }
+        spec[i] = typeof v !== 'number' || isNaN(v) || !isFinite(v)
+          ? epsilon
+          : Math.max(epsilon, Math.min(1.0 - epsilon, v));
       }
       for (let i = 0; i < 2000; i++) {
         const v = env[i];
-        if (typeof v !== 'number' || isNaN(v) || !isFinite(v)) {
-          env[i] = epsilon;
-        } else {
-          env[i] = Math.max(epsilon, Math.min(1.0 - epsilon, v));
-        }
+        env[i] = typeof v !== 'number' || isNaN(v) || !isFinite(v)
+          ? epsilon
+          : Math.max(epsilon, Math.min(1.0 - epsilon, v));
       }
 
-      // 2. Prepare Input Tensors with fresh 0-offset Float32Arrays: envelope shape [1, 1, 2000], spectrogram shape [1, 1, 64, 64]
       const cleanSpec = Float32Array.from(spec);
       const cleanEnv = Float32Array.from(env);
-
-      // Verify tensor data before creating tensors
-      if (cleanSpec.some(v => isNaN(v) || !isFinite(v))) {
-        throw new Error("Spectrogram contains NaN or Inf values after sanitization");
-      }
-      if (cleanEnv.some(v => isNaN(v) || !isFinite(v))) {
-        throw new Error("Envelope contains NaN or Inf values after sanitization");
-      }
 
       const tensorSpectrogram = new ort.Tensor('float32', cleanSpec, [1, 1, 64, 64]);
       const tensorEnvelope = new ort.Tensor('float32', cleanEnv, [1, 1, 2000]);
 
-      // 3. Run multi-modal attention transformer model with dynamic input feed mapping
       let outputs: ort.InferenceSession.ReturnType | null = null;
       const inputNames = sessionRef.current.inputNames || [];
       const feeds: Record<string, ort.Tensor> = {};
 
       if (inputNames.length === 1) {
-        // Single concatenated tensor input model
         const combined = new Float32Array(4096 + 2000);
         combined.set(cleanEnv, 0);
         combined.set(cleanSpec, 2000);
         feeds[inputNames[0]] = new ort.Tensor('float32', combined, [1, 1, 6096]);
       } else if (inputNames.length >= 2) {
-        // Multi-input tensor model: map based on name or position
         for (let i = 0; i < inputNames.length; i++) {
           const name = inputNames[i];
           const lower = name.toLowerCase();
@@ -162,22 +139,19 @@ export function useSonarInference(modelPath: string) {
           }
         }
       } else {
-        // Fallback default keys
         feeds['envelope'] = tensorEnvelope;
         feeds['spectogram'] = tensorSpectrogram;
       }
 
       try {
         outputs = await sessionRef.current.run(feeds);
-      } catch (feedError) {
-        // Second attempt with inverted/standard keys
-        console.warn('Primary ONNX run failed, attempting key fallback...', feedError);
+      } catch {
         try {
           outputs = await sessionRef.current.run({
             envelope: tensorEnvelope,
             spectrogram: tensorSpectrogram,
           });
-        } catch (e2) {
+        } catch {
           outputs = await sessionRef.current.run({
             input_1: tensorEnvelope,
             input_2: tensorSpectrogram,
@@ -185,41 +159,72 @@ export function useSonarInference(modelPath: string) {
         }
       }
 
-      // Extract 6-Channel Regression Output Head [1, 6]
-      const outputTensor = outputs ? (outputs.predictions || Object.values(outputs)[0]) : null; 
+      const outputTensor = outputs ? (outputs.predictions || Object.values(outputs)[0]) : null;
       if (!outputTensor || !outputTensor.data) {
-        throw new Error("No output tensor data returned from ONNX session.");
+        throw new Error('No output tensor data returned from ONNX session.');
       }
       const data = outputTensor.data as Float32Array;
 
-      // Extract raw outputs
-      const rawRange = Math.abs(data[0] || 0);
-      const rawAngle = data[1] || 0;
-      const rawWidth = Math.abs(data[2] || 0);
-      const rawHeight = Math.abs(data[3] || 0);
+      const onnxRange = Math.abs(data[0] || 0);
+      const onnxAngle = Math.max(-0.45, Math.min(0.45, data[1] || 0));
+      const onnxWidth = Math.abs(data[2] || 0);
+      const onnxHeight = Math.abs(data[3] || 0);
       const typeVal = Math.abs(data[4] || 0);
-      const rawConf = Math.min(1.0, Math.max(0.0, Math.abs(data[5] || 0.85)));
+      const onnxConf = Math.min(1.0, Math.max(0.0, Math.abs(data[5] || 0.85)));
 
-      // Classify type based on neural regression prediction head
-      let objType: 'obstacle' | 'wall' | 'doorway' | 'clear' = 'obstacle';
-      if (typeVal > 2.5) {
-        objType = 'doorway';
-      } else if (rawWidth > 0.8 || typeVal > 1.5) {
-        objType = 'wall';
-      } else if (rawRange > 3.5) {
-        objType = 'clear';
+      // Hybrid Neuro-Physical Fusion:
+      // Anchor distance to physical Time-of-Flight (acoustic.range) when ONNX range is out of physical bounds,
+      // or blend 75% physical ToF + 25% ONNX refinement when both agree.
+      const fusedRange = (onnxRange >= 0.25 && onnxRange <= 3.9 && !acoustic.isClear)
+        ? parseFloat((0.75 * acoustic.range + 0.25 * onnxRange).toFixed(2))
+        : acoustic.range;
+
+      // Determine final object classification & semantic label using both ONNX & multi-echo acoustics
+      let finalType: 'obstacle' | 'wall' | 'doorway' | 'clear' = acoustic.classifiedType;
+      let finalLabel: 'WALL' | 'DOORWAY' | 'DESK' | 'BED' | 'CHAIR' | 'OBSTACLE' | 'CLEAR' = acoustic.semanticLabel;
+
+      if (acoustic.isClear || fusedRange >= 3.75) {
+        finalType = 'clear';
+        finalLabel = 'CLEAR';
+      } else if (acoustic.classifiedType === 'doorway' || typeVal > 2.4) {
+        finalType = 'doorway';
+        finalLabel = 'DOORWAY';
+      } else if (acoustic.classifiedType === 'wall' || typeVal > 1.65) {
+        finalType = 'wall';
+        finalLabel = 'WALL';
+      } else {
+        finalType = 'obstacle';
+        if (onnxWidth > 1.25 || acoustic.semanticLabel === 'BED') {
+          finalLabel = 'BED';
+        } else if (onnxWidth > 0.7 || acoustic.semanticLabel === 'DESK') {
+          finalLabel = 'DESK';
+        } else if (acoustic.semanticLabel === 'CHAIR') {
+          finalLabel = 'CHAIR';
+        } else {
+          finalLabel = 'OBSTACLE';
+        }
       }
 
+      const fusedWidth = onnxWidth >= 0.35 && onnxWidth <= 2.5
+        ? parseFloat((0.6 * acoustic.estimatedWidth + 0.4 * onnxWidth).toFixed(2))
+        : acoustic.estimatedWidth;
+
+      const fusedHeight = onnxHeight >= 0.4 && onnxHeight <= 2.8
+        ? parseFloat((0.6 * acoustic.estimatedHeight + 0.4 * onnxHeight).toFixed(2))
+        : acoustic.estimatedHeight;
+
       setPrediction({
-        range: parseFloat(rawRange.toFixed(2)),
-        angle: parseFloat(rawAngle.toFixed(2)),
-        width: parseFloat(rawWidth.toFixed(2)),
-        height: parseFloat(rawHeight.toFixed(2)),
-        type: objType,
-        confidence: parseFloat(rawConf.toFixed(2)),
+        range: fusedRange,
+        angle: parseFloat(onnxAngle.toFixed(2)),
+        width: fusedWidth,
+        height: fusedHeight,
+        type: finalType,
+        semanticLabel: finalLabel,
+        pulseWidthMeters: acoustic.pulseWidthMeters,
+        secondaryEchoRange: acoustic.secondaryEchoRange,
+        confidence: parseFloat(Math.max(acoustic.confidence, onnxConf).toFixed(2)),
       });
       setError(null);
-      
     } catch (err: any) {
       console.warn('ONNX inference notice, running DSP acoustic fallback:', getErrorMessage(err));
       runDspAcousticInference(envelope1D);

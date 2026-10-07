@@ -10,6 +10,7 @@ export interface SensorData {
   roll: number;         // Roll angle in radians
   accuracy: number;     // Sensor accuracy (0-1)
   isCalibrated: boolean;
+  stepCount?: number;   // Pedestrian Dead Reckoning step counter
 }
 
 export interface CalibrationData {
@@ -40,17 +41,13 @@ export function computeDeltaSeconds(
 
   let dtSeconds: number;
   if (rawDiff > 1_000_000) {
-    // Nanoseconds to seconds (Android native sensor timestamp)
     dtSeconds = rawDiff / 1e9;
   } else if (rawDiff > 10_000) {
-    // Microseconds to seconds
     dtSeconds = rawDiff / 1e6;
   } else {
-    // Milliseconds to seconds
     dtSeconds = rawDiff / 1e3;
   }
 
-  // Guard against outlier or delayed ticks
   if (isNaN(dtSeconds) || !isFinite(dtSeconds) || dtSeconds < 0.001 || dtSeconds > 0.25) {
     return fallbackDt;
   }
@@ -60,15 +57,16 @@ export function computeDeltaSeconds(
 
 /**
  * Advanced sensor fusion with drift correction, resilient calibration,
- * and graceful fallback for devices missing hardware sensors.
+ * and Pedestrian Dead Reckoning (PDR) accelerometer step detection.
  */
-export function useSensorFusion() {
+export function useSensorFusion(onStepDetected?: (stepLengthMeters: number, headingYaw: number) => void) {
   const [sensorData, setSensorData] = useState<SensorData>({
     yaw: 0,
     pitch: 0,
     roll: 0,
     accuracy: 0,
     isCalibrated: false,
+    stepCount: 0,
   });
 
   const [calibrationData, setCalibrationData] = useState<CalibrationData>({
@@ -96,13 +94,21 @@ export function useSensorFusion() {
   const calibrationTimerRef = useRef<NodeJS.Timeout | null>(null);
   const onCalibrationCompleteCallbackRef = useRef<((success: boolean) => void) | null>(null);
 
+  // Step detection state (Pedestrian Dead Reckoning)
+  const lastStepTimeRef = useRef<number>(0);
+  const gravityMagBaselineRef = useRef<number>(9.81);
+  const stepCountRef = useRef<number>(0);
+  const onStepCallbackRef = useRef(onStepDetected);
+  useEffect(() => {
+    onStepCallbackRef.current = onStepDetected;
+  }, [onStepDetected]);
+
   const sensorConfig = getSensorConfig();
   const ALPHA = sensorConfig.gyroTrustFactor;
   const BETA = sensorConfig.accelTrustFactor;
   const targetSamples = sensorConfig.calibrationSamples || 40;
   const timeoutMs = sensorConfig.calibrationTimeoutMs || 1500;
 
-  // Complete calibration calculation
   const completeCalibration = useCallback(() => {
     if (calibrationTimerRef.current) {
       clearTimeout(calibrationTimerRef.current);
@@ -115,7 +121,6 @@ export function useSensorFusion() {
     setIsCalibrating(false);
     setCalibrationProgress(1);
 
-    // Compute gyro bias (average static drift)
     let gyroBias = { x: 0, y: 0, z: 0 };
     if (gyroSamples.length >= 5) {
       gyroBias = {
@@ -125,13 +130,13 @@ export function useSensorFusion() {
       };
     }
 
-    // Compute initial orientation level from accelerometer gravity baseline
     if (accelSamples.length >= 5) {
       const avgAx = accelSamples.reduce((sum, s) => sum + s.x, 0) / accelSamples.length;
       const avgAy = accelSamples.reduce((sum, s) => sum + s.y, 0) / accelSamples.length;
       const avgAz = accelSamples.reduce((sum, s) => sum + s.z, 0) / accelSamples.length;
       orientationRef.current.pitch = Math.atan2(-avgAx, Math.sqrt(avgAy * avgAy + avgAz * avgAz));
       orientationRef.current.roll = Math.atan2(avgAy, avgAz || 1);
+      gravityMagBaselineRef.current = Math.sqrt(avgAx * avgAx + avgAy * avgAy + avgAz * avgAz) || 9.81;
     }
 
     orientationRef.current.yaw = 0;
@@ -164,7 +169,6 @@ export function useSensorFusion() {
     }
   }, []);
 
-  // Start calibration process
   const startCalibration = useCallback((onComplete?: (success: boolean) => void) => {
     if (calibrationTimerRef.current) {
       clearTimeout(calibrationTimerRef.current);
@@ -188,7 +192,6 @@ export function useSensorFusion() {
     setCalibrationData(uncalibrated);
     appStore.setSensorCalibrated(false);
 
-    // Safety timeout ensures calibration ALWAYS finishes promptly even on sluggish or missing sensor devices
     calibrationTimerRef.current = setTimeout(() => {
       if (isCalibratingRef.current) {
         completeCalibration();
@@ -209,14 +212,12 @@ export function useSensorFusion() {
     let accelSub: any = null;
     let magSub: any = null;
 
-    // Gyroscope integration with drift correction
     try {
       gyroSub = gyroscope.subscribe(
         ({ x, y, z, timestamp }) => {
           const dt = computeDeltaSeconds(timestamp, lastGyroTimeRef.current, sensorConfig.gyroUpdateInterval);
           lastGyroTimeRef.current = timestamp;
 
-          // Collect samples during calibration
           if (isCalibratingRef.current) {
             gyroSamplesRef.current.push({ x, y, z });
             const progress = Math.min(0.99, gyroSamplesRef.current.length / targetSamples);
@@ -233,12 +234,10 @@ export function useSensorFusion() {
           const biasY = cal.isCalibrated ? cal.gyroBias.y : 0;
           const biasZ = cal.isCalibrated ? cal.gyroBias.z : 0;
 
-          // Integrate angular velocity with safe clamped dt
           orientationRef.current.yaw += (z - biasZ) * dt;
           orientationRef.current.pitch += (x - biasX) * dt;
           orientationRef.current.roll += (y - biasY) * dt;
 
-          // Normalize yaw to [-π, π]
           orientationRef.current.yaw = Math.atan2(
             Math.sin(orientationRef.current.yaw),
             Math.cos(orientationRef.current.yaw)
@@ -262,7 +261,6 @@ export function useSensorFusion() {
       handleError(err, ErrorCategory.SENSOR);
     }
 
-    // Accelerometer for tilt correction and initial level
     try {
       accelSub = accelerometer.subscribe(
         ({ x, y, z }) => {
@@ -271,19 +269,32 @@ export function useSensorFusion() {
             return;
           }
 
-          // Calculate pitch and roll from gravity vector
           const norm = Math.sqrt(y * y + z * z) || 1e-5;
           const accelPitch = Math.atan2(-x, norm);
           const accelRoll = Math.atan2(y, z || 1e-5);
 
-          // Complementary filter
           orientationRef.current.pitch = ALPHA * orientationRef.current.pitch + BETA * accelPitch;
           orientationRef.current.roll = ALPHA * orientationRef.current.roll + BETA * accelRoll;
+
+          // Pedestrian Dead Reckoning (PDR) Step Detection
+          const mag = Math.sqrt(x * x + y * y + z * z);
+          gravityMagBaselineRef.current = 0.97 * gravityMagBaselineRef.current + 0.03 * mag;
+          const dynamicLinearAccel = mag - gravityMagBaselineRef.current;
+          const now = Date.now();
+
+          if (dynamicLinearAccel > 2.1 && now - lastStepTimeRef.current > 460) {
+            lastStepTimeRef.current = now;
+            stepCountRef.current += 1;
+            if (onStepCallbackRef.current) {
+              onStepCallbackRef.current(0.62, orientationRef.current.yaw);
+            }
+          }
 
           setSensorData(prev => ({
             ...prev,
             pitch: orientationRef.current.pitch,
             roll: orientationRef.current.roll,
+            stepCount: stepCountRef.current,
           }));
         },
         (error) => {
@@ -294,7 +305,6 @@ export function useSensorFusion() {
       handleError(err, ErrorCategory.SENSOR);
     }
 
-    // Magnetometer with 3D tilt-compensation (pitch & roll) for precise compass heading
     try {
       magSub = magnetometer.subscribe(
         ({ x, y, z }) => {
@@ -308,14 +318,11 @@ export function useSensorFusion() {
           const cosR = Math.cos(roll);
           const sinR = Math.sin(roll);
 
-          // 3D Tilt-compensated magnetic vector
           const Bx = x * cosP + y * sinR * sinP + (z || 0) * cosR * sinP;
           const By = y * cosR - (z || 0) * sinR;
 
-          // Stable tilt-compensated heading
           const magYaw = Math.atan2(-By, Bx);
 
-          // Smooth complementary fusion avoiding ±π wrap-around jump
           const diff = Math.atan2(
             Math.sin(magYaw - orientationRef.current.yaw),
             Math.cos(magYaw - orientationRef.current.yaw)
@@ -334,13 +341,9 @@ export function useSensorFusion() {
             accuracy: 0.9,
           }));
         },
-        () => {
-          // Gracefully ignore missing magnetometer without breaking orientation
-        }
+        () => {}
       );
-    } catch {
-      // Missing hardware magnetometer fallback
-    }
+    } catch {}
 
     return () => {
       if (calibrationTimerRef.current) {
@@ -350,7 +353,7 @@ export function useSensorFusion() {
       if (accelSub) accelSub.unsubscribe();
       if (magSub) magSub.unsubscribe();
     };
-  }, [ALPHA, BETA, completeCalibration, sensorConfig.accelUpdateInterval, sensorConfig.gyroUpdateInterval, sensorConfig.magUpdateInterval, targetSamples]);
+  }, [ALPHA, BETA, completeCalibration, sensorConfig.accelUpdateInterval, sensorConfig.gyroUpdateInterval, sensorConfig.magTrustFactor, sensorConfig.magUpdateInterval, targetSamples]);
 
   return {
     sensorData,

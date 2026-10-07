@@ -1,0 +1,18 @@
+﻿%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#EFF6FF', 'primaryTextColor': '#0F172A', 'primaryBorderColor': '#0284C7', 'lineColor': '#0284C7', 'secondaryColor': '#FEFCE8', 'tertiaryColor': '#F8FAFC', 'fontSize': '18px'}}}%%
+flowchart LR
+    A(["1. Launch App & Single Tap"]) --> B["2. IMU Bias Calibration (40 Samples @ 50Hz)"]
+    B --> C["3. Emit 18-22kHz Ultrasonic Chirp (Speaker)"]
+    C --> D["4. Capture 48kHz 16-bit PCM Echo (Mic)"]
+    D --> E["5. Time-Gate (<0.5m Cross-Talk Blanked)"]
+    E --> F["6A. 1D FFT Cross-Correlation Envelope [2000]"]
+    E --> G["6B. 2D Goertzel DFT Spectrogram [64x64]"]
+    F & G --> H{"7. ONNX Model Ready?"}
+    H -->|Yes| I["8A. Multi-Modal ONNX Transformer Inference"]
+    H -->|Fallback| J["8B. Deterministic ToF Peak Heuristic"]
+    I & J --> K["9. Fuse with IMU Yaw -> 2D Cartesian SLAM Map (X, Y)"]
+    K --> L{"10. Obstacle < 0.6m?"}
+    L -->|Yes: Hazard| M["11A. Heavy Haptic Pulse + Priority Interrupt TTS"]
+    L -->|No: Safe| N["11B. Queued Spatial Voice + 2D Light Radar UI"]
+    M & N --> O{"12. Continue Scan?"}
+    O -->|Every 700ms| C
+    O -->|User Taps Stop| P(["13. Return to Idle State"])

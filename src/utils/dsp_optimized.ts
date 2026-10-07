@@ -1,18 +1,29 @@
 /**
- * OPTIMIZED DUAL-BRANCH DSP FEATURE EXTRACTION ENGINE
+ * OPTIMIZED DUAL-BRANCH DSP FEATURE EXTRACTION & ACOUSTIC OBJECT CLASSIFIER
  * Implements:
- * 1. 1D Temporal Path: FFT-based Cross-Correlation + 0.5m-4.0m Acoustic Time-Gating
- * 2. 2D Spectral Path: Goertzel-DFT 64x64 Time-Frequency Spectrogram
- * 
- * Performance optimizations:
- * - FFT-based cross-correlation (O(n log n) instead of O(n*m))
- * - Pre-computed FFT of reference chirp
- * - Optimized memory allocation
- * - SIMD-friendly operations where possible
+ * 1. Direct-Path (t0) Speaker-to-Microphone Synchronization
+ * 2. 1D Temporal Path: FFT-based Cross-Correlation + 0.25m-4.0m Acoustic Time-Gating + True SNR
+ * 3. 2D Spectral Path: Goertzel-DFT 64x64 Time-Frequency Spectrogram
+ * 4. Multi-Echo & Pulse-Width Object Understanding (Wall, Doorway, Desk, Bed, Chair, Obstacle, Clear)
  */
 
 const SAMPLE_RATE = 48000;
 const SPEED_OF_SOUND = 343; // metres per second
+
+export interface AcousticAnalysisResult {
+  range: number;
+  angle: number;
+  width: number;
+  height: number;
+  confidence: number;
+  isClear: boolean;
+  peakAmplitude: number;
+  pulseWidthMeters: number;
+  secondaryEchoRange: number | null;
+  ambientNoiseDb: number;
+  classifiedType: 'obstacle' | 'wall' | 'doorway' | 'clear';
+  semanticLabel: 'WALL' | 'DOORWAY' | 'DESK' | 'BED' | 'CHAIR' | 'OBSTACLE' | 'CLEAR';
+}
 
 /**
  * Generates a normalized reference ultrasonic chirp template (18kHz to 22kHz sweep over 20ms).
@@ -35,9 +46,6 @@ export function generateReferenceChirp(
 
 const REFERENCE_CHIRP = generateReferenceChirp();
 
-/**
- * Helper to ensure a number is a finite float bounded strictly between 0.0 and 1.0.
- */
 function sanitize(val: number): number {
   if (typeof val !== 'number' || isNaN(val) || !isFinite(val)) {
     return 0.0;
@@ -47,9 +55,6 @@ function sanitize(val: number): number {
   return val;
 }
 
-/**
- * Helper for audio waveform samples bounded between -1.0 and +1.0.
- */
 function sanitizeBipolar(val: number): number {
   if (typeof val !== 'number' || isNaN(val) || !isFinite(val)) {
     return 0.0;
@@ -61,7 +66,7 @@ function sanitizeBipolar(val: number): number {
 
 /**
  * Complex FFT and Cross-Correlation Engine
- * Cooley-Tukey Radix-2 DIT implementation supporting full complex forward & inverse transforms
+ * Cooley-Tukey Radix-2 DIT implementation
  */
 class ComplexFFT {
   static nextPowerOf2(n: number): number {
@@ -121,10 +126,6 @@ class ComplexFFT {
     }
   }
 
-  /**
-   * Fast frequency-domain matched filter cross-correlation
-   * R_xy(t) = IFFT( FFT(x) * conj(FFT(y)) )
-   */
   static crossCorrelation(x: Float32Array, y: Float32Array): Float32Array {
     const totalLen = x.length + y.length;
     const fftSize = this.nextPowerOf2(totalLen);
@@ -160,10 +161,50 @@ class ComplexFFT {
 }
 
 /**
+ * Locates the direct-path speaker-to-microphone pulse index (t0).
+ * If the buffer starts with a direct blast within the first 75% of the buffer,
+ * returns its index so echo Time-of-Flight is measured strictly relative to t0.
+ */
+export function findDirectPathIndex(xcorr: Float32Array): number {
+  if (!xcorr || xcorr.length < 1200) return 0;
+
+  // Search for the direct speaker-to-mic pulse in the first 60% of the recording
+  const searchLimit = Math.floor(xcorr.length * 0.6);
+  let maxVal = 0;
+  let maxIdx = 0;
+  let sum = 0;
+
+  for (let i = 0; i < searchLimit; i++) {
+    const v = xcorr[i];
+    sum += v;
+    if (v > maxVal) {
+      maxVal = v;
+      maxIdx = i;
+    }
+  }
+
+  const mean = sum / Math.max(1, searchLimit);
+  // Only shift t0 if there is a distinct direct-path pulse (> 3.2x mean background)
+  // AND enough trailing samples remain for a 4.0m echo window (~1120 samples)
+  if (maxVal > mean * 3.2 && maxIdx + 1150 < xcorr.length && maxIdx > 60) {
+    // Check if there is an earlier direct peak within the first 250 samples
+    let earlyMax = 0;
+    for (let i = 0; i < Math.min(80, xcorr.length); i++) {
+      if (xcorr[i] > earlyMax) earlyMax = xcorr[i];
+    }
+    if (earlyMax > maxVal * 0.65) {
+      return 0;
+    }
+    return maxIdx;
+  }
+
+  return 0;
+}
+
+/**
  * 1D TEMPORAL PATH:
- * Performs Cross-Correlation of raw PCM reflections against reference chirp,
- * applies 0.2m - 4.0m acoustic time-gating (blanking direct speaker bleed),
- * and resamples to target length (2000).
+ * Performs Direct-Path (t0) Aligned Cross-Correlation of raw PCM reflections against reference chirp,
+ * applies 0.2m - 4.0m acoustic time-gating, and preserves true SNR scaling.
  */
 export function computeEnvelopeOptimized(
   pcm: Int16Array,
@@ -179,27 +220,36 @@ export function computeEnvelopeOptimized(
     floatPcm[i] = sanitizeBipolar(sample);
   }
 
-  // Cross-correlation
   const xcorr = ComplexFFT.crossCorrelation(floatPcm, REFERENCE_CHIRP);
+  const t0 = findDirectPathIndex(xcorr);
 
-  // Time-gating: blank direct-path speaker bleed (< 0.2m / < 1.16ms) and capture up to 4.0m (~23.3ms)
-  const tMin = (2 * 0.2) / SPEED_OF_SOUND; // ~0.2m roundtrip
-  const tMax = (2 * 4.0) / SPEED_OF_SOUND; // ~4.0m roundtrip
+  // Time-gating relative to t0: blank direct speaker bleed (< 0.2m) and capture up to 4.0m
+  const tMin = (2 * 0.2) / SPEED_OF_SOUND; // ~56 samples at 48kHz
+  const tMax = (2 * 4.0) / SPEED_OF_SOUND; // ~1120 samples at 48kHz
 
-  const sampleStart = Math.min(xcorr.length - 1, Math.max(0, Math.floor(tMin * SAMPLE_RATE)));
-  const sampleEnd = Math.min(xcorr.length, Math.ceil(tMax * SAMPLE_RATE));
+  const sampleStart = Math.min(xcorr.length - 1, Math.max(0, t0 + Math.floor(tMin * SAMPLE_RATE)));
+  const sampleEnd = Math.min(xcorr.length, t0 + Math.ceil(tMax * SAMPLE_RATE));
   const gatedLength = Math.max(1, sampleEnd - sampleStart);
 
-  // Find max correlation strictly within the gated reflection window
-  let maxCorr = 1e-6;
+  // Compute both gated maximum and noise floor reference so quiet rooms are not artificially amplified to 1.0
+  let maxCorr = 0;
+  let sumCorr = 0;
   for (let i = sampleStart; i < sampleEnd; i++) {
     const v = xcorr[i];
+    sumCorr += v;
     if (v > maxCorr) maxCorr = v;
   }
+  const meanCorr = sumCorr / gatedLength;
 
-  const normFactor = maxCorr > 1e-9 ? maxCorr : 1.0;
+  // Reference ceiling: combine maxCorr with a minimum physical energy floor (~15.0 correlation units)
+  // so genuine echoes scale to [0.4 - 1.0], while pure silence/noise stays below 0.30
+  const snrRatio = meanCorr > 1e-6 ? maxCorr / meanCorr : 1.0;
+  const physicalFloor = 12.0;
+  const effectiveCeiling = snrRatio > 2.2
+    ? Math.max(maxCorr, physicalFloor * 0.5)
+    : Math.max(maxCorr * 2.8, physicalFloor);
+  const normFactor = effectiveCeiling > 1e-9 ? effectiveCeiling : 1.0;
 
-  // Resample gated region to targetLength
   const step = gatedLength / targetLength;
   for (let i = 0; i < targetLength; i++) {
     const idx = sampleStart + Math.floor(i * step);
@@ -211,18 +261,34 @@ export function computeEnvelopeOptimized(
 }
 
 /**
- * Extracts true physical distance from envelope peak using Time-of-Flight acoustics.
- * Returns distance in metres (0.2m to 4.0m) and detection confidence.
+ * Extracts physical distance, multi-echo doorway signatures, and object dimensions from the 1D envelope.
  */
 export function extractAcousticDistance(envelope: Float32Array): {
   range: number;
   confidence: number;
   isClear: boolean;
   peakAmplitude: number;
+  pulseWidthMeters: number;
+  secondaryEchoRange: number | null;
+  classifiedType: 'obstacle' | 'wall' | 'doorway' | 'clear';
+  semanticLabel: 'WALL' | 'DOORWAY' | 'DESK' | 'BED' | 'CHAIR' | 'OBSTACLE' | 'CLEAR';
+  estimatedWidth: number;
+  estimatedHeight: number;
 } {
-  const len = envelope.length;
+  const len = envelope ? envelope.length : 0;
   if (!envelope || len === 0) {
-    return { range: 4.0, confidence: 0.9, isClear: true, peakAmplitude: 0 };
+    return {
+      range: 4.0,
+      confidence: 0.9,
+      isClear: true,
+      peakAmplitude: 0,
+      pulseWidthMeters: 0,
+      secondaryEchoRange: null,
+      classifiedType: 'clear',
+      semanticLabel: 'CLEAR',
+      estimatedWidth: 0.5,
+      estimatedHeight: 1.0,
+    };
   }
 
   let sum = 0;
@@ -236,38 +302,137 @@ export function extractAcousticDistance(envelope: Float32Array): {
   }
   const stdDev = Math.sqrt(varSum / len);
 
-  // Dynamic peak detection threshold above background noise
-  const threshold = Math.max(0.35, meanNoise + 1.8 * stdDev);
+  // Adaptive Constant False Alarm Rate (CFAR) threshold
+  const threshold = Math.max(0.32, meanNoise + 2.0 * stdDev);
 
+  // Locate primary reflection peak (earliest strong reflection or global dominant peak)
   let peakIdx = -1;
   let maxVal = 0;
-
   for (let i = 0; i < len; i++) {
-    if (envelope[i] > threshold && envelope[i] > maxVal) {
+    if (envelope[i] > maxVal) {
       maxVal = envelope[i];
-      peakIdx = i;
+      if (envelope[i] > threshold) {
+        peakIdx = i;
+      }
     }
   }
 
-  if (peakIdx === -1) {
-    // No significant reflection detected - room is clear ahead
+  // Also check if there is a strong first-arrival peak (> 72% of global max) before a deeper wall reflection
+  if (peakIdx > 100) {
+    const firstArrivalCutoff = Math.max(threshold, maxVal * 0.72);
+    for (let i = 15; i < peakIdx - 60; i++) {
+      if (envelope[i] >= firstArrivalCutoff && envelope[i] >= envelope[i - 1] && envelope[i] >= envelope[i + 1]) {
+        peakIdx = i;
+        maxVal = envelope[i];
+        break;
+      }
+    }
+  }
+
+  if (peakIdx === -1 || maxVal < threshold) {
     return {
       range: 4.0,
-      confidence: 0.85,
+      confidence: 0.88,
       isClear: true,
       peakAmplitude: maxVal,
+      pulseWidthMeters: 0,
+      secondaryEchoRange: null,
+      classifiedType: 'clear',
+      semanticLabel: 'CLEAR',
+      estimatedWidth: 0.5,
+      estimatedHeight: 1.0,
     };
   }
 
-  // Linear ToF mapping from index to metric distance: 0.2m to 4.0m
   const physicalDistance = 0.2 + (peakIdx / len) * 3.8;
-  const snrConfidence = Math.min(0.98, Math.max(0.65, maxVal / (meanNoise + 0.05)));
+
+  // Measure echo pulse width (-6dB / 50% peak width) to distinguish planar walls vs furniture obstacles
+  const halfMax = maxVal * 0.55;
+  let leftIdx = peakIdx;
+  while (leftIdx > 0 && envelope[leftIdx] >= halfMax) leftIdx--;
+  let rightIdx = peakIdx;
+  while (rightIdx < len - 1 && envelope[rightIdx] >= halfMax) rightIdx++;
+  const pulseBins = Math.max(1, rightIdx - leftIdx);
+  const pulseWidthMeters = parseFloat(((pulseBins / len) * 3.8).toFixed(2));
+
+  // Search for a secondary deeper echo peak (> 0.75m behind primary peak) -> Doorway frame + deeper room reflection
+  const minSecondaryOffset = Math.floor((0.75 / 3.8) * len);
+  let secondaryIdx = -1;
+  let secondaryVal = 0;
+  for (let i = peakIdx + minSecondaryOffset; i < len; i++) {
+    if (envelope[i] > threshold * 0.85 && envelope[i] > secondaryVal) {
+      secondaryVal = envelope[i];
+      secondaryIdx = i;
+    }
+  }
+  const secondaryEchoRange = secondaryIdx !== -1
+    ? parseFloat((0.2 + (secondaryIdx / len) * 3.8).toFixed(2))
+    : null;
+
+  const snrConfidence = Math.min(0.98, Math.max(0.65, maxVal / (meanNoise + 0.08)));
+
+  // Acoustic Multi-Feature Object Classification
+  let classifiedType: 'obstacle' | 'wall' | 'doorway' | 'clear' = 'obstacle';
+  let semanticLabel: 'WALL' | 'DOORWAY' | 'DESK' | 'BED' | 'CHAIR' | 'OBSTACLE' | 'CLEAR' = 'OBSTACLE';
+  let estimatedWidth = 0.65;
+  let estimatedHeight = 1.2;
+
+  if (physicalDistance >= 3.75) {
+    classifiedType = 'clear';
+    semanticLabel = 'CLEAR';
+  } else if (
+    secondaryEchoRange !== null &&
+    secondaryVal >= maxVal * 0.42 &&
+    physicalDistance >= 0.55 &&
+    physicalDistance <= 2.8
+  ) {
+    // Dual-echo signature: doorframe edge reflection + deeper corridor reflection behind it
+    classifiedType = 'doorway';
+    semanticLabel = 'DOORWAY';
+    estimatedWidth = 0.9;
+    estimatedHeight = 2.0;
+  } else if (maxVal >= 0.72 && pulseWidthMeters >= 0.12) {
+    // High specular amplitude + broad multi-path spread = Flat Wall
+    classifiedType = 'wall';
+    semanticLabel = 'WALL';
+    estimatedWidth = 1.6;
+    estimatedHeight = 2.4;
+  } else if (pulseWidthMeters >= 0.09 || maxVal >= 0.64) {
+    // Broad mid-level reflection = Bed or Wide Desk
+    classifiedType = 'obstacle';
+    if (pulseWidthMeters >= 0.14) {
+      semanticLabel = 'BED';
+      estimatedWidth = 1.4;
+      estimatedHeight = 0.8;
+    } else {
+      semanticLabel = 'DESK';
+      estimatedWidth = 1.0;
+      estimatedHeight = 0.85;
+    }
+  } else if (pulseWidthMeters <= 0.04) {
+    // Compact reflection = Chair / Narrow Obstacle
+    classifiedType = 'obstacle';
+    semanticLabel = 'CHAIR';
+    estimatedWidth = 0.55;
+    estimatedHeight = 0.95;
+  } else {
+    classifiedType = 'obstacle';
+    semanticLabel = 'OBSTACLE';
+    estimatedWidth = 0.65;
+    estimatedHeight = 1.1;
+  }
 
   return {
     range: parseFloat(physicalDistance.toFixed(2)),
     confidence: parseFloat(snrConfidence.toFixed(2)),
-    isClear: false,
-    peakAmplitude: maxVal,
+    isClear: classifiedType === 'clear',
+    peakAmplitude: parseFloat(maxVal.toFixed(3)),
+    pulseWidthMeters,
+    secondaryEchoRange,
+    classifiedType,
+    semanticLabel,
+    estimatedWidth,
+    estimatedHeight,
   };
 }
 
@@ -297,7 +462,7 @@ export function computeSpectrogramOptimized(
   const fStart = 18000;
   const fEnd = 22000;
   const freqStep = (fEnd - fStart) / Math.max(1, rows - 1);
-  
+
   const coeffs = new Float32Array(rows);
   const ks = new Uint32Array(rows);
   for (let r = 0; r < rows; r++) {
@@ -337,7 +502,6 @@ export function computeSpectrogramOptimized(
     }
   }
 
-  // Normalize spectrogram to [0, 1]
   const specNormFactor = globalMax > 1e-9 ? globalMax : 1.0;
   for (let i = 0; i < totalElements; i++) {
     spec[i] = sanitize(spec[i] / specNormFactor);
@@ -346,6 +510,5 @@ export function computeSpectrogramOptimized(
   return spec;
 }
 
-// Export optimized versions as default for backward compatibility
 export const computeEnvelope = computeEnvelopeOptimized;
 export const computeSpectrogram = computeSpectrogramOptimized;

@@ -1,6 +1,7 @@
 /**
- * 2D ROOM MAP SPATIAL ANALYZER & VOICE NARRATIVE SYNTHESIZER
- * Evaluates the 2D Top-Down SLAM room map and generates context-aware speech guidance based on mapped geometry.
+ * 2D ROOM MAP SPATIAL ANALYZER, VOICE NARRATIVE SYNTHESIZER & VOICE COMMAND PARSER
+ * Evaluates the 2D Top-Down SLAM room map, generates context-aware speech guidance based on mapped geometry,
+ * and parses spoken voice commands from blind users.
  */
 
 export interface MapObject {
@@ -12,8 +13,96 @@ export interface MapObject {
   width: number;      // Object width (metres)
   height: number;     // Object height (metres)
   type: 'obstacle' | 'wall' | 'doorway' | 'clear';
-  label: string;      // e.g. "DESK", "BED", "WALL", "OBSTACLE", "DOORWAY"
+  label: string;      // e.g. "DESK", "BED", "CHAIR", "WALL", "OBSTACLE", "DOORWAY"
   confidence: number; // 0.0 to 1.0
+}
+
+export type VoiceCommandAction =
+  | { type: 'SWITCH_ROOM_MODE' }
+  | { type: 'SWITCH_ROAD_MODE' }
+  | { type: 'START_SCAN' }
+  | { type: 'STOP_SCAN' }
+  | { type: 'DESCRIBE_MAP' }
+  | { type: 'FIND_DOORWAY' }
+  | { type: 'CLEAR_MAP' }
+  | { type: 'OPEN_GOOGLE_MAPS'; destination?: string }
+  | { type: 'NAVIGATE_DESTINATION'; destination: string }
+  | { type: 'UNKNOWN'; rawText: string };
+
+/**
+ * Parses natural spoken phrases from a blind user into deterministic app actions.
+ * Supports commands like "Click Room Mode", "Road Mode", "Start Scan", "Stop Scan",
+ * "Describe Map", "Where is the door", "Open Google Maps to pharmacy", etc.
+ */
+export function parseVoiceCommandIntent(spokenText: string): VoiceCommandAction {
+  const raw = (spokenText || '').trim();
+  const text = raw.toLowerCase();
+
+  if (!text) {
+    return { type: 'UNKNOWN', rawText: '' };
+  }
+
+  if (text.includes('room mode') || text.includes('indoor') || text.includes('inside')) {
+    return { type: 'SWITCH_ROOM_MODE' };
+  }
+
+  if (
+    text.includes('road mode') ||
+    text.includes('outdoor') ||
+    text.includes('street mode') ||
+    text.includes('sidewalk')
+  ) {
+    return { type: 'SWITCH_ROAD_MODE' };
+  }
+
+  if (text.includes('google map') || text.includes('co-pilot') || text.includes('copilot')) {
+    const match = text.match(/(?:to|for)\s+([a-z0-9\s]+)$/i);
+    return {
+      type: 'OPEN_GOOGLE_MAPS',
+      destination: match?.[1]?.trim(),
+    };
+  }
+
+  if (text.includes('navigate to') || text.includes('walk to') || text.includes('take me to')) {
+    const dest = text
+      .replace(/.*(?:navigate to|walk to|take me to)\s+/i, '')
+      .trim();
+    if (dest.length > 0) {
+      return { type: 'NAVIGATE_DESTINATION', destination: dest };
+    }
+  }
+
+  if (text.includes('door') || text.includes('exit') || text.includes('way out')) {
+    return { type: 'FIND_DOORWAY' };
+  }
+
+  if (
+    text.includes('describe') ||
+    text.includes('what is around') ||
+    text.includes('read map') ||
+    text.includes('summary')
+  ) {
+    return { type: 'DESCRIBE_MAP' };
+  }
+
+  if (text.includes('stop scan') || text.includes('pause scan') || text === 'stop') {
+    return { type: 'STOP_SCAN' };
+  }
+
+  if (
+    text.includes('start scan') ||
+    text.includes('begin scan') ||
+    text.includes('scan room') ||
+    text === 'scan'
+  ) {
+    return { type: 'START_SCAN' };
+  }
+
+  if (text.includes('clear map') || text.includes('reset map')) {
+    return { type: 'CLEAR_MAP' };
+  }
+
+  return { type: 'UNKNOWN', rawText: raw };
 }
 
 /**

@@ -10,6 +10,7 @@ class AssetCopyPackage : ReactPackage {
     override fun createNativeModules(reactContext: ReactApplicationContext): List<NativeModule> {
         val modules = ArrayList<NativeModule>()
         modules.add(AssetCopyModule(reactContext))
+        modules.add(LocationAndVoiceModule(reactContext))
         return modules
     }
 

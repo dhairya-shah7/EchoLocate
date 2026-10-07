@@ -1,0 +1,34 @@
+﻿%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#EFF6FF', 'primaryTextColor': '#0F172A', 'primaryBorderColor': '#0284C7', 'lineColor': '#0284C7', 'secondaryColor': '#FEFCE8', 'tertiaryColor': '#F8FAFC', 'fontSize': '18px'}}}%%
+flowchart LR
+    USER_IN["External Entity: Visually Impaired User"]
+    IMU_HW["External Sensor: 3-Axis IMU (50Hz)"]
+    AUDIO_HW["External Hardware: Speaker & Mic (48kHz)"]
+
+    P1(("1.0 Scan & Calib Controller"))
+    P2(("2.0 Complementary IMU Filter"))
+    P3(("3.0 Full-Duplex Audio Engine"))
+    D1["[D1 Store: AppStore & Config Presets]"]
+
+    P4(("4.0 Dual-Branch DSP Extractor"))
+    D2["[D2 Store: sonar_model_fusion.onnx]"]
+    P5(("5.0 ONNX & ToF Inference Engine"))
+
+    P6(("6.0 2D Polar-to-Cartesian Mapper"))
+    D3["[D3 Store: 2D Spatial Map Objects]"]
+    P7(("7.0 Voice, Haptic & Radar Synthesizer"))
+    USER_OUT["External Entity: User Feedback Output"]
+
+    USER_IN -->|Single-Tap Input| P1
+    P1 -->|Calibrate Request| P2
+    IMU_HW -->|Gyro, Accel, Mag| P2
+    P2 -->|Drift-Corrected Yaw| D1
+    P1 -->|700ms Ping Trigger| P3
+    AUDIO_HW -->|18-22kHz Echo PCM| P3
+    P3 -->|Int16Array Buffer| P4
+    P4 -->|1D Envelope + 64x64 Spec| P5
+    D2 -->|Model Weights| P5
+    P5 -->|Range, Angle, Class| P6
+    D1 -->|Global Heading Yaw| P6
+    P6 -->|X, Y, BearingDeg| D3
+    D3 -->|Active Obstacles| P7
+    P7 -->|TTS Speech + Haptics + 2D Radar| USER_OUT
