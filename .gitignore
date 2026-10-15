@@ -76,3 +76,10 @@ yarn-error.log
 
 # Compiled APK binaries
 *.apk
+
+# Python and Generated Datasets
+__pycache__/
+*.pyc
+data/
+*.npz
+*.pt

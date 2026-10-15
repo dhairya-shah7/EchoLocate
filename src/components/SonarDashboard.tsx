@@ -110,6 +110,14 @@ export default function SonarDashboard() {
   const lastSpokenTextRef = useRef<string>('');
   const lastUiTapTimeRef = useRef<number>(0);
 
+  interface HazardDebounceState {
+    label: string;
+    distBin: number;
+    isCritical: boolean;
+    timestamp: number;
+  }
+  const lastHazardStateRef = useRef<HazardDebounceState | null>(null);
+
   // Pedestrian Dead Reckoning step callback shifts the 2D room map & updates Ground-SLAM pose + breadcrumbs
   const handleUserStepDetected = useCallback(
     (stepLengthMeters: number, headingYawRad: number) => {
@@ -191,6 +199,9 @@ export default function SonarDashboard() {
       }
     };
 
+    const startSub = Tts.addEventListener('tts-start', () => {
+      isSpeakingRef.current = true;
+    });
     const finishSub = Tts.addEventListener('tts-finish', clearSpeakingFlag);
     const cancelSub = Tts.addEventListener('tts-cancel', clearSpeakingFlag);
     const errorSub = Tts.addEventListener('tts-error', clearSpeakingFlag);
@@ -220,6 +231,7 @@ export default function SonarDashboard() {
     return () => {
       mounted = false;
       clearSpeakingFlag();
+      startSub?.remove();
       finishSub?.remove();
       cancelSub?.remove();
       errorSub?.remove();
@@ -311,6 +323,65 @@ export default function SonarDashboard() {
     [isScreenReaderEnabled]
   );
 
+  /**
+   * Conversational Hazard Dispatcher with Cooldown Hysteresis:
+   * 1. Guarantees sentence completion - never cuts off TTS mid-word.
+   * 2. Enforces a 2.8-second repeat cooldown for stationary obstacles.
+   * 3. Reserves immediate interruption strictly for life-safety emergencies (< 0.35m or drop-off).
+   */
+  const dispatchHazardAlert = useCallback(
+    (
+      instructionText: string,
+      obstacleLabel: string,
+      rangeM: number,
+      isLifeThreatening: boolean = false
+    ) => {
+      const now = Date.now();
+      const distBin = Math.round(rangeM * 4) / 4; // Quantize to 0.25m bins
+      const prev = lastHazardStateRef.current;
+      const isCriticalProximity = rangeM < 0.35 || isLifeThreatening;
+
+      // 1. If TTS is actively speaking:
+      if (isSpeakingRef.current) {
+        // Only interrupt ongoing sentence if it's a critical new crash risk (< 0.35m or drop-off)
+        // that wasn't already announced in critical mode
+        if (isCriticalProximity && (!prev || !prev.isCritical)) {
+          lastHazardStateRef.current = {
+            label: obstacleLabel,
+            distBin,
+            isCritical: true,
+            timestamp: now,
+          };
+          speakText(instructionText, true, false);
+        }
+        // Otherwise, allow the active sentence to finish completely without mid-word cutoffs!
+        return;
+      }
+
+      // 2. If TTS is idle, enforce a 2.8-second repeat cooldown for the same obstacle & distance bin
+      if (
+        prev &&
+        prev.label === obstacleLabel &&
+        Math.abs(prev.distBin - distBin) <= 0.25 &&
+        now - prev.timestamp < 2800 &&
+        !isCriticalProximity
+      ) {
+        return; // Suppress repeat within cooldown
+      }
+
+      lastHazardStateRef.current = {
+        label: obstacleLabel,
+        distBin,
+        isCritical: isCriticalProximity,
+        timestamp: now,
+      };
+
+      // Speak smoothly without aggressive cancellation
+      speakText(instructionText, isCriticalProximity, false);
+    },
+    [speakText]
+  );
+
   // Refresh outdoor GPS & street name when switching to ROAD mode
   const refreshOutdoorGpsContext = useCallback(
     async (lockHeadingDeg: number) => {
@@ -379,6 +450,7 @@ export default function SonarDashboard() {
     if (isScanning || isCalibratingState) {
       setIsScanning(false);
       setIsCalibratingState(false);
+      lastHazardStateRef.current = null;
       stopSonarStream();
       speakText('Scanning stopped.', true, true);
     } else {
@@ -557,6 +629,7 @@ export default function SonarDashboard() {
           setMapObjects([]);
           setRoomSectors(createInitialRoomSectors());
           setGroundSlam(createInitialGroundSlamState());
+          lastHazardStateRef.current = null;
           speakText('2D Ground SLAM map cleared.', true, false);
           break;
         case 'OPEN_GOOGLE_MAPS':
@@ -736,7 +809,12 @@ export default function SonarDashboard() {
     }
 
     if (isGroundHazard && groundProj.hazardSpeech) {
-      speakText(groundProj.hazardSpeech, true, false);
+      dispatchHazardAlert(
+        groundProj.hazardSpeech,
+        groundProj.overrideLabel || 'GROUND_HAZARD',
+        range,
+        groundProj.anomaly === 'GROUND_DROP_OFF'
+      );
       return;
     }
 
@@ -747,7 +825,12 @@ export default function SonarDashboard() {
         userHeadingDeg
       );
       if (isImmediateHazard) {
-        speakText(floorplan.safePath.spokenInstruction, true, false);
+        dispatchHazardAlert(
+          floorplan.safePath.spokenInstruction,
+          label,
+          range,
+          range < 0.35
+        );
       } else {
         const baseNarrative = generateMapSpeechNarrative(updatedMap);
         speakText(
@@ -762,7 +845,16 @@ export default function SonarDashboard() {
         userHeadingDeg,
         roadContext
       );
-      speakText(roadGuidance, isImmediateHazard, false);
+      if (isImmediateHazard) {
+        dispatchHazardAlert(
+          roadGuidance,
+          label,
+          range,
+          range < 0.35
+        );
+      } else {
+        speakText(roadGuidance, false, false);
+      }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [prediction]);
